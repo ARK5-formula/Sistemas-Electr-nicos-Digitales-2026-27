@@ -1,0 +1,111 @@
+#include <LPC17xx.h>
+#include "reg_masks.h"
+
+#define F_CPU       (SystemCoreClock)		//Frecuencia de la CPU = 100MHz
+#define F_PCLK      (F_CPU/4)						//PCLK = CCLK/4 = 25MHz
+
+//Anchos de Pulso del SERVOMOTOR (Posiciones)
+#define T_ON_MIN    0.5e-3 							//0.5ms = -90 grados
+#define T_ON_MID    1.5e-3 							//1.5ms = 0 grados
+#define T_ON_MAX    2.5e-3 							//2.5ms = +90 grados
+
+
+//FUNCIONAMIENTO DEL SERVOMOTOR 1 + SERVOMOTOR 2
+
+volatile float angulo = 0; //Indica el ángulo que queremos (se modifica desde el WATCH)
+													 //Solo sirve para el SERVOMOTOR 1, el otro será opuesto (-) y ya
+
+//NECESITAMOS 2 CANALES PARA FUNCIONAR
+//SERVOMOTOR 1: Canal 1 -> PWM1.1 (P2.0 + MR1)
+//SERVOMOTOR 2: Canal 2 -> PWM1.2 (P2.1 + MR2)
+
+
+//Recibimos el ángulo deseado y lo convertimos en TICKS (lo entiende el Hardware para trabajar)
+void servo_set_angle(uint8_t canal, float angle)
+{
+	uint32_t Nticks; //Guardaremos el numero de ticks que debe durar el pulso correspondiente a su angulo en esta variable
+	
+	if (angle < -90) //Límite para ángulo de -90º
+	{
+		angle = -90;
+	}
+	
+	if (angle > 90) //Límite para ángulo de 90º
+	{
+		angle = 90;
+	}
+	
+	//Ancho de Pulso = Tmin + ((Tmax - Tmin)/180)* (angle + 90)  -> en Ticks
+	//NTICKS varían en función del ángulo que metamos (Mayor ángulo = Mayor NTICKS)
+  Nticks = (uint32_t) ((F_PCLK * T_ON_MIN) + (F_PCLK * (T_ON_MAX - T_ON_MIN) / 180.0) * (angle + 90) + 0.5); //El resultado es un número
+	//Explicación de la Fórmula:
+	//La formula es la de una recta normal de siempre:
+	//y = y_min + ((y_max - y_min) / (x_max - x_min))* (x - x_min) INTERPOLACIÓN LINEAL
+	//"angle + 90" es porque nosotros hacemos -90 a 90; Pero el programa lo interpreta de 0 a 180
+	//Desplaza el ángulo para que el rango vaya de 0 a 180 en vez de -90 a +90. Con -90 da 0, con 0 da 90, con +90 da 180.
+	//uint32_t sirve para el truncado, pero redondea hacia abajo (1.9 = 1). Si le sumamos 0,5 al resultado final podemos recuperar los Nticks que se pierden. 
+  
+	//T_ON en NTICKS para cada SERVOMOTOR
+	//SERVOMOTOR 1
+	if (canal == 1)
+	{
+		LPC_PWM1->MR1 = Nticks; 							//Se guardan los NTICKS correspondientes al angulo en el Match Register 1 (MR1)
+		LPC_PWM1->LER = M1LEN; 								//Latch Enable Register (LER): MR1 se carga al llegar TC a MR0
+	}
+	
+	//SERVOMOTOR 2
+	else
+	{
+		LPC_PWM1->MR2 = Nticks;								//Se guardan los NTICKS correspondientes al angulo en el Match Register 2 (MR2)
+		LPC_PWM1->LER |= M2LEN;								//Latch Enable Register (LER): MR2 se carga al llegar TC a MR0
+	}	
+}
+
+void servo_init(float T_PWM) {
+  LPC_SC->PCONP |= PCPWM1;                    //Enciende el periférico PWM1
+  LPC_SC->PCLKSEL0 &= ~(0x3 << 12);           //Limpia bits 13:12; Por qué son los relacionados a PCLK_PWM1
+																							//00 = CCLK/4
+																							//01 = CCLK
+																							//10 = CCLK/2
+																							//11 = CCLK/8
+	
+	LPC_SC->PCLKSEL0 |= PCLK_CCLK_DIV_4 << 12;  //Set PCLK = CCLK/4
+
+	//SERVOMOTOR 1
+  LPC_PINCON->PINSEL4 &= ~(0x3 << 0);   			//Limpia P2.0
+  LPC_PINCON->PINSEL4 |=  (0x1 << 0);   			//Asignamos P2.0 = PWM1.1 (OUTPUT)
+	
+	//SERVOMOTOR 2
+	LPC_PINCON->PINSEL4 &= ~(0x3 << 2);					//Limpia P2.1
+	LPC_PINCON->PINSEL4 |= (0x1 << 2);					//Asignamos P2.1 = PWM1.2 (OUTPUT)
+
+  //NOTE: For PWM mode, MR0 must be set up prior to the PWM being enabled
+  LPC_PWM1->MR0 = (uint32_t)(F_PCLK*T_PWM);  //Match Register 0: set Periodo PWM
+  LPC_PWM1->MCR |= MR0R;            				 //Reset timer on Match0
+  LPC_PWM1->PCR |= PWMENA1 | PWMENA2;        //Habilita PWM1.1 y PWM1.2 (OUTPUT)
+  LPC_PWM1->TCR = CNT_EN | PWM_EN;  				 //Timer Control Register: Enable Timer & PWM Mode
+  
+	//Función para posiciones del SERVOMOTOR
+	servo_set_angle (1, 0);		//Sin esto MR1 quedaría = 0 tras el reset y el SERVOMOTOR 1 no recibiría ningún pulso
+	servo_set_angle (2, 0);		//Sin esto MR2 quedaría = 0 tras el reset y el SERVOMOTOR 2 no recibiría ningún pulso
+}
+
+//BUCLE PRINCIPAL
+int main()
+{
+	//Creamos una variable local para ir guardando el último ángulo aplicado
+	float angulo_previo = 0;
+	
+	//Inicializamos Periodo = 20ms
+	servo_init(20e-3);
+	
+	while (1)
+	{
+		if (angulo != angulo_previo) 				//Significa que el ángulo habrá cambiado
+		{
+			servo_set_angle(1, angulo); 			//LLama a la función de arriba y actualiza el valor en el Canal 1 = SERVOMOTOR 1
+			servo_set_angle(2, -angulo);			//LLama a la función de arriba y actualiza el valor en el Canal 2 = SERVOMOTOR 2
+			angulo_previo=angulo; 						//Guardamos el nuevo valor en "angulo_previo" para futuras preguntas en el IF
+		}
+	} //Si el ángulo es el mismo al introducido no hacemos nada y se queda todo igual
+}
